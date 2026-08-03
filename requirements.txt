@@ -1,0 +1,17 @@
+# Stratum core
+pydantic>=2.0
+numpy>=1.24
+
+# LLM providers
+requests>=2.0
+openai>=1.0
+
+# API
+fastapi>=0.100
+uvicorn[standard]>=0.20
+
+# Demo UI
+streamlit>=1.20
+
+# Testing
+pytest>=7.0
