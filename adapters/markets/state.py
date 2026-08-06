@@ -17,6 +17,7 @@ from stratum.core.temporal_context import (
     Event,
     Trend,
     Segment,
+    Period,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,10 +69,11 @@ class MarketStateBuilder:
            - Split price series by trend direction
            - Label segments "up-trend" | "down-trend" | "ranging"
            - Use rolling returns or a simple slope heuristic
-        7. Detect Period (optional):
-           - Use FFT on the volume series to find dominant frequency
-           - If a strong frequency is found, set period string
-             e.g. "periodic with 30-minute cycle" and period_confidence
+        7. Detect Periodicity via FFT on the volume series:
+           - Use _detect_period() on the volume stream
+           - If a dominant cycle is found → Period object
+             (markets commonly show daily/hourly cycles in volume)
+           - Otherwise period remains None
         8. Generate a plain-English summary, e.g.:
            "AAPL trended up +4.2% over 60 minutes with a volume spike
             at 14:30. Price broke above the 20-period moving average."
@@ -160,21 +162,31 @@ class MarketStateBuilder:
         self,
         timestamps: list[datetime],
         volumes: list[float],
-    ) -> tuple[Optional[str], float]:
+    ) -> Optional[Period]:
         """
-        Detect cyclical patterns in volume via FFT (optional).
+        Detect cyclical patterns in volume via FFT.
 
         Steps to implement:
-        1. Apply numpy FFT to the volume series
-        2. Find the dominant frequency (excluding DC component)
-        3. If the dominant component's magnitude is > 30% of the total
-           non-DC energy, report it:
-           period_minutes = 1 / freq * interval_minutes
-           return f"cyclical with ~{period:.0f}-minute period", confidence
-        4. Otherwise return (None, 0.0)
+        1. Compute the time delta between consecutive samples
+        2. Apply numpy FFT to the volume series
+        3. Find the dominant frequency (excluding DC / zero-frequency component)
+        4. If the dominant component's magnitude exceeds ~30% of the total
+           non-DC energy, treat it as a real cycle:
+           - cycle_duration_seconds = 1 / dominant_freq
+           - confidence = magnitude / total_non_dc_energy  (clamped 0–1)
+           - description = f"Cyclical with ~{cycle_duration_seconds:.0f}s period"
+           - signal_source = "volume"
+           - Return Period(...)
+        5. If no dominant cycle is found, return None
+
+        Markets data frequently exhibits periodic behaviour:
+        - Intraday patterns (opening/closing volume surges)
+        - Time-of-day effects on liquidity
+        A confident Period here gives the LLM important context about
+        whether a price move is cyclical or structural.
 
         Returns:
-            (period_str, confidence) where confidence ∈ [0, 1]
+            Period or None
         """
         ...
 

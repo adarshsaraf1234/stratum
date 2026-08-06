@@ -62,7 +62,7 @@ class MarketAdapter(DomainAdapter):
         """
         Return "markets".
         """
-        ...
+        return "markets"
 
     def parse_signals(self, raw_data: Any) -> list:
         """

@@ -62,13 +62,14 @@ class SREAdapter(DomainAdapter):
         """
         Return "sre".
         """
-        ...
+        return "sre"
+        
 
     def parse_signals(self, raw_data: Any) -> list:
         """
         Delegate to parse_sre_signals(raw_data) from signals.py.
         """
-        ...
+        
 
     def build_state(self, signals: list) -> TemporalContext:
         """

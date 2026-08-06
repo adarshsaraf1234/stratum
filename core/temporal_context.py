@@ -38,6 +38,18 @@ class Segment(BaseModel):
     dominant_signal: str = ""
 
 
+class Period(BaseModel):
+    """Cyclical pattern detected in the signal window (T2SP periodicity extraction).
+
+    Computed deterministically (typically via FFT on the signal series).
+    None signals mean no strong cycle was detected.
+    """
+    description: str = ""
+    cycle_duration_seconds: float = Field(default=0.0, ge=0.0)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    signal_source: str = ""  # which metric the cycle was detected on
+
+
 class TemporalContext(BaseModel):
     """The universal structured context passed to the ReasoningAgent."""
     domain: str
@@ -46,8 +58,7 @@ class TemporalContext(BaseModel):
     events: list[Event] = Field(default_factory=list)
     trend: Trend = Field(default_factory=Trend)
     segments: list[Segment] = Field(default_factory=list)
-    period: Optional[str] = None
-    period_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    period: Optional[Period] = None
     summary: str = ""
     metadata: dict = Field(default_factory=dict)
 
