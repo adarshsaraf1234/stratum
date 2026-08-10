@@ -35,11 +35,13 @@ class SREStateBuilder:
         context = builder.build_state(signals)
     """
 
-    # Threshold constants (tune these)
-    CPU_HIGH_THRESHOLD: float = 85.0        # percent
-    MEMORY_HIGH_THRESHOLD: float = 90.0     # percent
-    LATENCY_SLA_MS: float = 500.0           # milliseconds
-    BREACH_DURATION_MINUTES: int = 3        # consecutive minutes required
+    # Threshold constants — match OTel signal units
+    CPU_HIGH_THRESHOLD: float = 85.0            # percent
+    LATENCY_SLA_SECONDS: float = 0.5           # seconds (500ms SLA)
+    MEMORY_SPIKE_MULTIPLIER: float = 2.0       # >2x rolling mean = spike
+    BREACH_DURATION_SECONDS: int = 180         # 3 consecutive minutes
+    SPIKE_WINDOW: int = 5                      # samples for rolling baseline
+    SPIKE_MULTIPLIER: float = 3.0              # >3x rolling mean = spike
 
     def __init__(self):
         pass
@@ -213,7 +215,48 @@ class SREStateBuilder:
         Returns:
             Trend
         """
-        ...
+        n = len(values)
+        if n < 2:
+            return Trend(direction="flat", rate=0.0, description="Insufficient data for trend.")
+
+        # 1. Convert datetimes to seconds elapsed since the first sample
+        t0 = timestamps[0]
+        time_seconds = [(t - t0).total_seconds() for t in timestamps]
+
+        # 2. Linear regression: fit y = slope * t + intercept
+        slope, intercept = np.polyfit(time_seconds, values, 1)
+
+        # 3. Normalise slope to "% change per minute" relative to the mean
+        mean_val = float(np.mean(values))
+        if mean_val == 0.0:
+            rate_per_minute = 0.0
+        else:
+            rate_per_minute = (slope * 60.0) / mean_val * 100.0
+
+        # 4. Classify direction
+        stddev = float(np.std(values))
+        cv = (stddev / mean_val) if mean_val > 0 else 0.0  # coefficient of variation
+
+        if cv > 0.3:
+            direction = "volatile"
+        elif rate_per_minute > 0.5:
+            direction = "rising"
+        elif rate_per_minute < -0.5:
+            direction = "falling"
+        else:
+            direction = "flat"
+
+        # 5. Build human-readable description
+        window_seconds = time_seconds[-1] if time_seconds else 0
+        window_minutes = window_seconds / 60.0
+        description = (
+            f"Trend: {direction} | "
+            f"Rate: {rate_per_minute:+.1f}% per minute | "
+            f"Mean: {mean_val:.1f} | "
+            f"Window: {window_minutes:.1f} min"
+        )
+
+        return Trend(direction=direction, rate=round(rate_per_minute, 2), description=description)
 
     def _detect_events(
         self,
@@ -240,8 +283,113 @@ class SREStateBuilder:
         Returns:
             list[Event]
         """
-        ...
+        n = len(values)
+        if n == 0:
+            return []
 
+        # ── Map metric → threshold value ──────────────────────────
+        threshold_map = {
+            "cpu_usage": self.CPU_HIGH_THRESHOLD,          # 85.0%
+            "memory_usage": self.MEMORY_SPIKE_MULTIPLIER,   # 2x rolling mean
+            "latency_p99": self.LATENCY_SLA_SECONDS,        # 0.5s
+        }
+        threshold = threshold_map.get(metric_name)
+        if threshold is None:
+            return []
+
+        events: list[Event] = []
+
+        # ═══════════════════════════════════════════════════════════
+        # PASS 1: Threshold breach detection (consecutive-run scan)
+        # ═══════════════════════════════════════════════════════════
+
+        breached_indices: set[int] = set()
+
+        # Memory has no fixed threshold — it uses a rolling-mean spike
+        # approach instead, handled in Pass 2.
+        if metric_name != "memory_usage":
+            i = 0
+            while i < n:
+                if values[i] <= threshold:
+                    i += 1
+                    continue
+
+                # Found the start of a breach run — scan until it ends
+                run_start = i
+                while i < n and values[i] > threshold:
+                    i += 1
+                run_end = i  # first index *after* the breach run
+
+                run_duration = (
+                    timestamps[run_end - 1] - timestamps[run_start]
+                ).total_seconds()
+
+                if run_duration >= self.BREACH_DURATION_SECONDS:
+                    peak_value = max(values[run_start:run_end])
+
+                    # Severity by margin above threshold (cap-safe)
+                    headroom = 100.0 - threshold if metric_name == "cpu_usage" else (
+                        threshold * 5.0  # for latency: 0.5 × 5 = 2.5s ceiling
+                    )
+                    excess_ratio = (
+                        (peak_value - threshold) / headroom
+                    ) if headroom > 0 else 0.0
+
+                    if excess_ratio > 0.5:
+                        severity = "critical"
+                    elif excess_ratio > 0.25:
+                        severity = "high"
+                    else:
+                        severity = "medium"
+
+                    events.append(Event(
+                        timestamp=timestamps[run_start],
+                        type="threshold_breach",
+                        severity=severity,
+                        source=metric_name,
+                        description=(
+                            f"{metric_name} breached {threshold} threshold "
+                            f"for {run_duration:.0f}s (peak={peak_value:.1f})"
+                        ),
+                        raw_value=peak_value,
+                    ))
+
+                    # Mark these indices so spikes don't double-report
+                    for idx in range(run_start, run_end):
+                        breached_indices.add(idx)
+
+        # ═══════════════════════════════════════════════════════════
+        # PASS 2: Spike detection (rolling-baseline outliers)
+        # ═══════════════════════════════════════════════════════════
+
+        for i in range(self.SPIKE_WINDOW, n):
+            if i in breached_indices:
+                # Don't double-emit — Pass 1 already covered it
+                continue
+
+            rolling_baseline = np.mean(values[i - self.SPIKE_WINDOW : i])
+            if rolling_baseline == 0.0:
+                continue
+
+            if values[i] > rolling_baseline * self.SPIKE_MULTIPLIER:
+                events.append(Event(
+                    timestamp=timestamps[i],
+                    type="spike",
+                    severity="low",
+                    source=metric_name,
+                    description=(
+                        f"{metric_name} spiked to {values[i]:.1f} "
+                        f"({values[i]/rolling_baseline:.1f}× rolling baseline {rolling_baseline:.1f})"
+                    ),
+                    raw_value=values[i],
+                    expected_value=round(float(rolling_baseline), 2),
+                ))
+
+        # Sort by timestamp (guaranteed stable output order)
+        events.sort(key=lambda e: e.timestamp)
+        return events
+
+    
     def _detect_segments(
         self,
         timestamps: list[datetime],
@@ -264,7 +412,87 @@ class SREStateBuilder:
         Returns:
             list[Segment]
         """
-        ...
+        n = len(values)
+        window = 5
+        if n < window + 1:
+            return [
+                Segment(
+                    start=timestamps[0],
+                    end=timestamps[-1],
+                    label="stable",
+                )
+            ]
+
+        # ── 1. Compute rolling variance ──────────────────────────────
+        rolling_var = np.zeros(n)
+        for i in range(window, n):
+            rolling_var[i] = float(np.var(values[i - window : i]))
+
+        # ── 2. Detect change points (variance jumps > 2×) ────────────
+        # Skip the first window entries (still zero) to avoid false
+        # positives from the transition out of the zero-padding.
+        changes: list[int] = []
+        for i in range(window + 1, n):
+            if rolling_var[i - 1] > 0.0 and rolling_var[i] > rolling_var[i - 1] * 2.0:
+                changes.append(i)
+
+        # ── 3. Build segments between change points ──────────────────
+        overall_mean = float(np.mean(values))
+        overall_std = float(np.std(values))
+
+        segments: list[Segment] = []
+        start_idx = 0
+        all_boundaries = changes + [n]
+
+        for boundary in all_boundaries:
+            end_idx = min(boundary, n)
+            if end_idx <= start_idx:
+                continue
+
+            seg_vals = values[start_idx:end_idx]
+            seg_mean = float(np.mean(seg_vals))
+            seg_std = float(np.std(seg_vals))
+            deviation = (
+                (seg_mean - overall_mean) / overall_std if overall_std > 0 else 0.0
+            )
+            seg_cv = (seg_std / seg_mean) if seg_mean > 0 else 0.0
+
+            # ── 4. Label the segment ─────────────────────────────
+            if seg_cv > 0.4:
+                label = "anomalous"
+            elif deviation > 0.7:
+                label = "degrading"
+            elif deviation < -0.7:
+                label = "recovering"
+            else:
+                label = "stable"
+
+            segments.append(
+                Segment(
+                    start=timestamps[start_idx],
+                    end=timestamps[end_idx - 1],
+                    label=label,
+                )
+            )
+            start_idx = end_idx
+
+        # ── 5. Merge adjacent segments with the same label ──────────
+        if len(segments) >= 2:
+            merged: list[Segment] = [segments[0]]
+            for seg in segments[1:]:
+                prev = merged[-1]
+                if seg.label == prev.label:
+                    merged[-1] = Segment(
+                        start=prev.start,
+                        end=seg.end,
+                        label=prev.label,
+                    )
+                else:
+                    merged.append(seg)
+            segments = merged
+
+        return segments
+
 
     def _detect_period(
         self,
@@ -295,7 +523,59 @@ class SREStateBuilder:
         Returns:
             Period or None
         """
-        ...
+        n = len(values)
+        if n < 4:
+            return None
+
+        # 1. Compute time delta (seconds) between samples
+        deltas = np.diff([t.timestamp() for t in timestamps])
+        if not np.all(deltas > 0):
+            return None
+        # 2. Apply FFT to the value series
+        values = np.array(values)
+        fft_vals = np.fft.fft(values)   
+        fft_freqs = np.fft.fftfreq(n, d = np.mean(deltas))
+        
+        positive_mask = fft_freqs > 0
+        pos_freqs = fft_freqs[positive_mask]
+        pos_magnitudes = np.abs(fft_vals[positive_mask])
+
+        # 4. Find the dominant frequency
+        peak_index = int(np.argmax(pos_magnitudes))
+        dominant_freq = float(pos_freqs[peak_index])
+        peak_magnitude = float(pos_magnitudes[peak_index])
+
+        # Guard: frequency must be a positive real cycle
+        if dominant_freq <= 0.0:
+            return None
+
+        # 5. Confidence = share of the dominant component in total energy
+        total_energy = float(np.sum(pos_magnitudes)) or 1.0
+        confidence = min(peak_magnitude / total_energy, 1.0)
+
+        # Need a clearly dominant cycle to report a period
+        if confidence < 0.30:
+            return None
+
+        # Convert frequency → cycle duration
+        cycle_seconds = 1.0 / dominant_freq
+
+        # A cycle longer than the window itself is not a real cycle
+        window_seconds = (timestamps[-1] - timestamps[0]).total_seconds()
+        if cycle_seconds > window_seconds * 0.9:
+            return None
+
+        description = (
+            f"Periodic with ~{cycle_seconds:.0f}s cycle "
+            f"(dominant freq={dominant_freq:.4f} Hz)"
+        )
+
+        return Period(
+            description=description,
+            cycle_duration_seconds=round(cycle_seconds, 2),
+            confidence=round(confidence, 3),
+            signal_source=signal_name,
+        )
 
     def _generate_summary(
         self,
@@ -319,4 +599,44 @@ class SREStateBuilder:
         Returns:
             str
         """
-        ...
+        sentences: list[str] = []
+
+        # ── 1. Event summary sentence ──────────────────────────────
+        high_severity = [
+            e for e in events if e.severity in ("high", "critical")
+        ]
+        total_events = len(events)
+
+        if total_events == 0:
+            sentences.append("No anomalies detected.")
+        else:
+            if high_severity:
+                sentences.append(
+                    f"{len(high_severity)} high-severity event(s) detected "
+                    f"out of {total_events} total."
+                )
+            else:
+                sentences.append(
+                    f"{total_events} event(s) detected, none reaching "
+                    "high severity."
+                )
+
+        # ── 2. Trend sentence — the steepest |rate| trend ───────────
+        if trends:
+            metric_name, worst_trend = max(
+                trends.items(), key=lambda kv: abs(kv[1].rate)
+            )
+            # Only mention the trend if it's meaningful
+            if worst_trend.direction != "flat":
+                sentences.append(
+                    f"{metric_name} is {worst_trend.direction} "
+                    f"at {worst_trend.rate:+.1f}%/min."
+                )
+
+        # ── 3. Segment sentence ────────────────────────────────────
+        if segments:
+            last_label = segments[-1].label
+            sentences.append(f"Window is in a '{last_label}' segment.")
+
+        # ── 4. Join into 1-3 sentences ─────────────────────────────
+        return " ".join(sentences)
