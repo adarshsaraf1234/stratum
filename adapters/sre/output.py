@@ -6,6 +6,7 @@ SRE output schemas and LLM prompt builder for Root Cause Analysis (RCA).
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 from stratum.core.schemas import StructuredDecision
@@ -63,19 +64,18 @@ class SREAdapter(DomainAdapter):
         Return "sre".
         """
         return "sre"
-        
 
     def parse_signals(self, raw_data: Any) -> list:
         """
         Delegate to parse_sre_signals(raw_data) from signals.py.
         """
-        
+        return parse_sre_signals(raw_data)
 
     def build_state(self, signals: list) -> TemporalContext:
         """
         Delegate to self.state_builder.build_state(signals).
         """
-        ...
+        return self.state_builder.build_state(signals)
 
     def build_prompt(self, context: TemporalContext) -> str:
         """
@@ -106,7 +106,49 @@ class SREAdapter(DomainAdapter):
         Returns:
             str
         """
-        ...
+        # ── 1. System-style instruction ─────────────────────────────
+        prompt = (
+            "You are an SRE root cause analysis engine. Analyze the "
+            "following system state and identify the root cause of the "
+            "incident. Respond with JSON only.\n\n"
+        )
+
+        # ── 2. TemporalContext serialized as JSON ───────────────────
+        # Pydantic 1.x → .dict() + default=str serializes datetimes safely
+        context_json = json.dumps(context.dict(), indent=2, default=str)
+        prompt += "=== SYSTEM STATE ===\n"
+        prompt += context_json + "\n\n"
+
+        # ── 3. Plain-English summary (surfaced prominently) ─────────
+        prompt += "=== SUMMARY ===\n"
+        prompt += (
+            context.summary if context.summary else "No summary available."
+        )
+        prompt += "\n\n"
+
+        # ── 4. Expected output schema ───────────────────────────────
+        prompt += (
+            "=== EXPECTED OUTPUT ===\n"
+            "Respond with a single JSON object in this exact format:\n"
+            "{\n"
+            '  "root_cause": "<string>",\n'
+            '  "severity": "low|medium|high|critical",\n'
+            '  "analysis": "<string>",\n'
+            '  "confidence": "<float between 0.0 and 1.0>",\n'
+            '  "affected_services": ["<string>"],\n'
+            '  "remediation_steps": ["<string>"],\n'
+            '  "evidence": ["<string>"],\n'
+            '  "suggested_actions": ["<string>"]\n'
+            "}\n\n"
+        )
+
+        # ── 5. Constraint emphasis ──────────────────────────────────
+        prompt += (
+            "Base your analysis ONLY on the provided context. "
+            "Do not invent metrics or services."
+        )
+
+        return prompt
 
     def parse_output(self, llm_response: str) -> dict:
         """
@@ -129,4 +171,71 @@ class SREAdapter(DomainAdapter):
         Returns:
             dict
         """
-        ...
+        # ── 1. Error passthrough ────────────────────────────────────
+        if llm_response.startswith("ERROR:"):
+            return {
+                "analysis": llm_response,
+                "confidence": 0.0,
+                "suggested_actions": [],
+                "root_cause": "Unknown",
+            }
+
+        # ── 2. Extract JSON from the response ───────────────────────
+        data: Optional[dict] = None
+
+        # Try a direct JSON parse first
+        try:
+            data = json.loads(llm_response)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+
+        # Fallback: extract the first {...} JSON block via regex
+        if data is None:
+            match = re.search(r"\{.*\}", llm_response, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    data = None
+
+        # No JSON at all — return a safe default
+        if data is None:
+            logger.warning(
+                "No JSON found in LLM response: %s", llm_response[:200]
+            )
+            return {
+                "analysis": llm_response,
+                "confidence": 0.0,
+                "suggested_actions": [],
+                "root_cause": "Unknown",
+            }
+
+        # ── 3 & 4. Map fields + defaults for missing keys ───────────
+        def _as_list(value: Any) -> list[str]:
+            if isinstance(value, list):
+                return [str(item) for item in value]
+            if isinstance(value, str) and value.strip():
+                return [value]
+            return []
+
+        # Confidence may come back as a string — coerce safely
+        try:
+            confidence = float(data.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        result = {
+            "analysis": str(data.get("analysis", "")).strip(),
+            "confidence": confidence,  # clamped below
+            "suggested_actions": _as_list(data.get("suggested_actions")),
+            "root_cause": str(data.get("root_cause", "Unknown")).strip(),
+            "severity": str(data.get("severity", "medium")).strip(),
+            "affected_services": _as_list(data.get("affected_services")),
+            "remediation_steps": _as_list(data.get("remediation_steps")),
+            "evidence": _as_list(data.get("evidence")),
+        }
+
+        # ── 5. Clamp confidence to [0.0, 1.0] ───────────────────────
+        result["confidence"] = max(0.0, min(1.0, result["confidence"]))
+
+        return result
