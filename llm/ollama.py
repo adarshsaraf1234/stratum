@@ -71,7 +71,33 @@ class OllamaLLM(BaseLLM):
 
         Log each request with logger.info (model + prompt length).
         """
-        ...
+        try :
+            url = f"{self.base_url}/api/generate"
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "temperature": kwargs.get("temperature", self.temperature),
+                "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+                "stream": False,
+            }
+            # logger.info("Ollama request: model=%s, prompt_length=%d", self.model, len(prompt))
+            response = requests.post(url, json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            result = response.json()
+            if result == 200:
+                return result.get("response", "")
+            else:
+                logger.error("Ollama returned unexpected status: %s", result)
+                return f"ERROR: Unexpected response from Ollama: {result}"
+        except requests.exceptions.ConnectionError:
+            logger.error("Cannot connect to Ollama at %s", self.base_url)
+            return "ERROR: Cannot connect to Ollama. Is the server running?"
+        except requests.exceptions.Timeout:
+            logger.error("Ollama request timed out after %d seconds", self.timeout)
+            return "ERROR: Ollama request timed out."
+        except requests.exceptions.RequestException as e:
+            logger.error("Ollama request failed: %s", str(e))
+            return f"ERROR: {str(e)}"
 
     def list_models(self) -> list[str]:
         """
@@ -85,4 +111,13 @@ class OllamaLLM(BaseLLM):
 
         On failure, log the error and return an empty list.
         """
-        ...
+        try:
+            url = f"{self.base_url}/api/tags"
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            models = [m["name"] for m in data.get("models", []) if "name" in m]
+            return models
+        except requests.exceptions.RequestException as e:
+            logger.error("Failed to list Ollama models: %s", str(e))
+            return []
