@@ -80,15 +80,11 @@ class OllamaLLM(BaseLLM):
                 "max_tokens": kwargs.get("max_tokens", self.max_tokens),
                 "stream": False,
             }
-            # logger.info("Ollama request: model=%s, prompt_length=%d", self.model, len(prompt))
+            logger.info("Ollama request: model=%s, prompt_length=%d", self.model, len(prompt))
             response = requests.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
             result = response.json()
-            if result == 200:
-                return result.get("response", "")
-            else:
-                logger.error("Ollama returned unexpected status: %s", result)
-                return f"ERROR: Unexpected response from Ollama: {result}"
+            return result.get("response", "")
         except requests.exceptions.ConnectionError:
             logger.error("Cannot connect to Ollama at %s", self.base_url)
             return "ERROR: Cannot connect to Ollama. Is the server running?"

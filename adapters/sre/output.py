@@ -9,7 +9,7 @@ import logging
 import re
 from typing import Any, Optional
 
-from stratum.core.schemas import StructuredDecision
+from stratum.core.schemas import Signal, StructuredDecision
 from stratum.core.temporal_context import TemporalContext
 from stratum.core.base_adapter import DomainAdapter
 from stratum.adapters.sre.state import SREStateBuilder
@@ -67,8 +67,17 @@ class SREAdapter(DomainAdapter):
 
     def parse_signals(self, raw_data: Any) -> list:
         """
-        Delegate to parse_sre_signals(raw_data) from signals.py.
+        Convert raw input into Signal objects.
+
+        - If raw_data is already a list of Signal objects (e.g. from the
+          OTel simulator), pass it through directly.
+        - Otherwise delegate to parse_sre_signals() for raw dicts,
+          JSON strings, or CSV input.
         """
+        if isinstance(raw_data, list) and all(
+            isinstance(item, Signal) for item in raw_data
+        ):
+            return raw_data
         return parse_sre_signals(raw_data)
 
     def build_state(self, signals: list) -> TemporalContext:
