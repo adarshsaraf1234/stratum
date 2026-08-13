@@ -30,7 +30,7 @@ class OllamaLLM(BaseLLM):
         base_url: str = "http://localhost:11434",
         temperature: float = 0.1,
         max_tokens: int = 2048,
-        timeout: int = 60,
+        timeout: int = 120,
     ):
         """
         Args:

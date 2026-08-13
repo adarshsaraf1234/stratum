@@ -49,7 +49,11 @@ def get_scenario(name: str) -> dict:
     3. If not found, raise KeyError with a helpful message
        listing available scenarios
     """
-    ...
+    if name in SRE_SCENARIOS:
+        return SRE_SCENARIOS[name]
+    else:
+        available = ', '.join(SRE_SCENARIOS.keys())
+        raise KeyError(f"Scenario '{name}' not found. Available scenarios: {available}")
 
 
 def list_scenarios() -> list[str]:
@@ -59,7 +63,7 @@ def list_scenarios() -> list[str]:
     Returns:
         list[str] — e.g. ["cpu_spike", "memory_leak", ...]
     """
-    ...
+    return list(SRE_SCENARIOS.keys())
 
 
 def generate_scenario_signals(scenario_name: str, **kwargs) -> list:
@@ -73,4 +77,15 @@ def generate_scenario_signals(scenario_name: str, **kwargs) -> list:
     Returns:
         list[Signal]
     """
-    ...
+    config = get_scenario(scenario_name)
+    # Strip non-generator keys (e.g. "description") — only the
+    # generate_incident_signals() parameters should be forwarded.
+    generator_keys = {
+        "incident_type",
+        "service_name",
+        "duration_seconds",
+        "tick_interval_seconds",
+        "seed",
+    }
+    params = {k: v for k, v in config.items() if k in generator_keys}
+    return generate_incident_signals(**params, **kwargs)
