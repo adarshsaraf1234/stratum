@@ -13,27 +13,27 @@ from stratum.adapters.sre.signals import generate_incident_signals
 # Add new scenarios here to make them appear in the demo.
 SRE_SCENARIOS: dict[str, dict] = {
     "cpu_spike": {
-        "description": "Frequent CPU spikes (30% probability per tick) peaking at 99%.",
+        "description": "Sustained CPU saturation (180+ ticks) peaking at 99%.",
         "incident_type": "cpu_spike",
-        "duration_seconds": 30,
+        "duration_seconds": 240,
         "tick_interval_seconds": 1,
     },
     "memory_leak": {
-        "description": "Heap leak of ~2-4 MB per tick, memory climbs continuously.",
+        "description": "Heap leak of ~10-20 MB per tick after a 60-tick grace period.",
         "incident_type": "memory_leak",
-        "duration_seconds": 45,
+        "duration_seconds": 150,
         "tick_interval_seconds": 1,
     },
     "latency_degradation": {
         "description": "Latency spikes with 30% probability, P99 degrades to 2.5-6.2s.",
         "incident_type": "latency_degradation",
-        "duration_seconds": 30,
+        "duration_seconds": 60,
         "tick_interval_seconds": 1,
     },
     "normal": {
         "description": "Healthy bounds — <1% anomaly probability.",
         "incident_type": "normal",
-        "duration_seconds": 30,
+        "duration_seconds": 60,
         "tick_interval_seconds": 1,
     },
 }
@@ -88,4 +88,6 @@ def generate_scenario_signals(scenario_name: str, **kwargs) -> list:
         "seed",
     }
     params = {k: v for k, v in config.items() if k in generator_keys}
-    return generate_incident_signals(**params, **kwargs)
+    # kwargs override scenario defaults (e.g. duration_seconds=300)
+    params.update(kwargs)
+    return generate_incident_signals(**params)

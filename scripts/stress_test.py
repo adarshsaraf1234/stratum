@@ -61,7 +61,7 @@ def main() -> int:
     args = build_parser().parse_args()
 
     # Import here so a bad CLI invocation fails fast without importing the stack.
-    from data.sre.scenarios import generate_scenario_signals
+    from stratum.data.sre.scenarios import generate_scenario_signals
     from stratum.adapters.sre.output import SREAdapter
     from stratum.llm.ollama import OllamaLLM
     from stratum.core.reasoning_agent import ReasoningAgent

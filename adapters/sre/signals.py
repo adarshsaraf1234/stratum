@@ -18,7 +18,7 @@ import logging
 import json
 import io
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from opentelemetry import metrics
@@ -57,10 +57,11 @@ class _SignalCapture:
         value: float,
         unit: str,
         extra_tags: Optional[dict[str, Any]] = None,
+        timestamp: Optional[datetime] = None,
     ) -> None:
         self._signals.append(
             Signal(
-                timestamp=datetime.now(),
+                timestamp=timestamp or datetime.now(),
                 name=name,
                 value=value,
                 unit=unit,
@@ -80,32 +81,44 @@ class _SignalCapture:
 
 INCIDENT_PRESETS: dict[str, dict[str, Any]] = {
     "cpu_spike": {
-        "cpu_spike_probability": 0.30,
+        "cpu_saturation_probability": 0.02,   # ~19% chance per 60-tick window
+        "cpu_saturation_start_tick": 30,      # guaranteed saturation at tick 30
+        "cpu_saturation_duration_ticks": 180,
         "cpu_spike_min": 88.0,
         "cpu_spike_max": 99.1,
         "base_cpu_mean": 30.0,
+        "base_load_amplitude": 8.0,
+        "base_load_noise": 4.0,
         "memory_leak_enabled": False,
         "latency_spike_probability": 0.05,
     },
     "memory_leak": {
-        "cpu_spike_probability": 0.03,
+        "cpu_saturation_probability": 0.003,  # keep CPU mostly healthy
         "base_cpu_mean": 40.0,
+        "base_load_amplitude": 2.0,
+        "base_load_noise": 4.0,
         "memory_leak_enabled": True,
-        "memory_leak_per_tick_bytes": (2_000_000, 4_000_000),
+        "memory_leak_grace_ticks": 60,
+        "memory_leak_per_tick_bytes": (2_000_000, 5_000_000),
         "latency_spike_probability": 0.03,
     },
     "latency_degradation": {
-        "cpu_spike_probability": 0.08,
+        "cpu_saturation_probability": 0.001,  # don't let CPU dominate this scenario
         "base_cpu_mean": 50.0,
+        "base_load_amplitude": 2.0,
+        "base_load_noise": 4.0,
         "memory_leak_enabled": False,
         "latency_spike_probability": 0.30,
         "latency_degradation_range": (2.5, 6.2),
     },
     "normal": {
-        "cpu_spike_probability": 0.01,
+        "cpu_saturation_probability": 0.0,    # truly quiet
         "base_cpu_mean": 35.0,
+        "base_load_amplitude": 0.0,           # zero drift — no false trends
+        "base_load_noise": 1.0,               # tiny walk — max ~5.7% drift
         "memory_leak_enabled": False,
-        "latency_spike_probability": 0.01,
+        "latency_spike_probability": 0.0,     # zero latency anomalies
+        "latency_sigma": 0.10,
     },
 }
 
@@ -133,12 +146,20 @@ class OTelPipelineSimulator:
         capture: _SignalCapture,
         service_name: str = "payment-api",
         incident_type: str = "normal",
+        tick_interval_seconds: int = 1,
         seed: int = 42,
     ):
         self.capture = capture
         self.service_name = service_name
         self.incident_type = incident_type
+        self.tick_interval_seconds = tick_interval_seconds
         self.preset = INCIDENT_PRESETS.get(incident_type, INCIDENT_PRESETS["normal"])
+
+        # Simulated clock — timestamps advance by tick_interval_seconds per
+        # tick, NOT wall-clock time. This keeps the deterministic state
+        # builder's duration-based checks (e.g. BREACH_DURATION_SECONDS)
+        # meaningful: a 180-tick saturation spans 180 simulated seconds.
+        self._start_time = datetime.now()
 
         # Deterministic seeded randomness
         random.seed(seed)
@@ -165,6 +186,10 @@ class OTelPipelineSimulator:
         # Internal mutable state
         self.tick_count = 0
         self.heap_leak_bytes = 0.0
+        # Sustained CPU saturation: ticks remaining in the current
+        # saturation event (a real incident stays saturated, it doesn't
+        # flicker). 0 means "not currently saturating".
+        self._cpu_saturation_remaining = 0
 
     def tick(self) -> None:
         """
@@ -179,33 +204,76 @@ class OTelPipelineSimulator:
         """
         self.tick_count += 1
 
+        # Simulated timestamp for this tick — matches the configured
+        # tick interval so window durations are meaningful to downstream
+        # deterministic logic.
+        sim_ts = self._start_time + timedelta(
+            seconds=(self.tick_count - 1) * self.tick_interval_seconds
+        )
+
         # ── Base CPU load with a gentle diurnal sinusoid ────────────────
+        # Amplitude is preset-configurable: incident scenarios allow mild
+        # drift, but "normal" sets it to 0 so the only variation is the ±4
+        # random walk — preventing false trend events.
         base_load = self.preset.get("base_cpu_mean", 35.0) + (
-            math.sin(self.tick_count / 30.0) * 8.0
+            math.sin(self.tick_count / 30.0)
+            * self.preset.get("base_load_amplitude", 8.0)
         )
 
         # ── CPU ─────────────────────────────────────────────────────────
-        spike_prob = self.preset.get("cpu_spike_probability", 0.05)
-        if self._rng.random() < spike_prob:
+        # Real incidents saturate and STAY saturated (180+ ticks), rather
+        # than flickering on/off. Once a saturation event starts, remaining
+        # ticks stay above the threshold until the duration elapses.
+        # A preset may force a guaranteed saturation start tick so every
+        # run definitely exhibits the incident (deterministic benchmarks).
+        force_start = (
+            self.preset.get("cpu_saturation_start_tick", 0)
+            and self.tick_count == self.preset["cpu_saturation_start_tick"]
+        )
+        if self._cpu_saturation_remaining > 0:
+            # Mid-saturation: keep CPU pinned high, 88-99%
+            cpu = self._rng.uniform(
+                self.preset.get("cpu_spike_min", 88.0),
+                self.preset.get("cpu_spike_max", 99.1),
+            )
+            status = "503"
+            self._cpu_saturation_remaining -= 1
+        elif force_start or self._rng.random() < self.preset.get(
+            "cpu_saturation_probability", 0.05
+        ):
+            # Start a new saturation event
+            sat_ticks = self.preset.get("cpu_saturation_duration_ticks", 180)
+            self._cpu_saturation_remaining = sat_ticks - 1
             cpu = self._rng.uniform(
                 self.preset.get("cpu_spike_min", 88.0),
                 self.preset.get("cpu_spike_max", 99.1),
             )
             status = "503"
         else:
-            cpu = max(0.0, min(100.0, base_load + self._rng.uniform(-4.0, 4.0)))
+            noise = self.preset.get("base_load_noise", 4.0)
+            cpu = max(0.0, min(100.0, base_load + self._rng.uniform(-noise, noise)))
             status = "200"
         cpu = round(cpu, 2)
 
         attrs = {"service.name": self.service_name, "http.status_code": status}
         self.cpu_gauge.set(cpu, attributes=attrs)
         self.capture.record(
-            "cpu_usage", cpu, "%", extra_tags={"http.status_code": status}
+            "cpu_usage",
+            cpu,
+            "%",
+            extra_tags={"http.status_code": status},
+            timestamp=sim_ts,
         )
 
         # ── Memory ──────────────────────────────────────────────────────
         base_mem_mb = 256.0
-        if self.preset.get("memory_leak_enabled", False):
+        # Only leak after the grace period elapses — gives a 1-2 minute
+        # healthy baseline before the leak begins, closer to real incidents.
+        leak_grace_ticks = self.preset.get("memory_leak_grace_ticks", 60)
+        if (
+            self.preset.get("memory_leak_enabled", False)
+            and self.tick_count > leak_grace_ticks
+        ):
             leak_range = self.preset.get(
                 "memory_leak_per_tick_bytes", (500_000, 1_500_000)
             )
@@ -217,7 +285,7 @@ class OTelPipelineSimulator:
         )
 
         self.memory_gauge.set(memory_bytes, attributes=attrs)
-        self.capture.record("memory_usage", memory_bytes, "By")
+        self.capture.record("memory_usage", memory_bytes, "By", timestamp=sim_ts)
 
         # ── Latency ─────────────────────────────────────────────────────
         cpu_spiking = cpu > 85.0
@@ -228,11 +296,16 @@ class OTelPipelineSimulator:
             degradation = self.preset.get("latency_degradation_range", (2.5, 6.2))
             latency_s = self._rng.uniform(*degradation)
         else:
-            latency_s = self._rng.lognormvariate(math.log(0.08), 0.2)
+            # Baseline latency — normal presets can shrink the lognormal
+            # sigma to reduce false-positive spike events.
+            sigma = self.preset.get(
+                "latency_sigma", 0.2
+            )
+            latency_s = self._rng.lognormvariate(math.log(0.08), sigma)
         latency_s = round(latency_s, 4)
 
         self.latency_histogram.record(latency_s, attributes=attrs)
-        self.capture.record("latency_p99", latency_s, "s")
+        self.capture.record("latency_p99", latency_s, "s", timestamp=sim_ts)
 
 
 # ── Public API ──────────────────────────────────────────────────────────
@@ -273,6 +346,7 @@ def generate_incident_signals(
         capture=capture,
         service_name=service_name,
         incident_type=incident_type,
+        tick_interval_seconds=tick_interval_seconds,
         seed=seed,
     )
 

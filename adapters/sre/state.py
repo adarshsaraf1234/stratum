@@ -120,23 +120,37 @@ class SREStateBuilder:
 
         # ── 4. Events per metric ────────────────────────────────────
         events: list[Event] = []
-        events += self._detect_events(
-            timestamps=[s[0] for s in cpu_pts],
-            values=[s[1] for s in cpu_pts],
-            metric_name="cpu_usage",
-        )
-        events += self._detect_events(
-            timestamps=[s[0] for s in mem_pts],
-            values=[s[1] for s in mem_pts],
-            metric_name="memory_usage",
-        )
-        events += self._detect_events(
-            timestamps=[s[0] for s in lat_pts],
-            values=[s[1] for s in lat_pts],
-            metric_name="latency_p99",
-        )
-        events.sort(key=lambda e: e.timestamp)
 
+        # Track which metrics already emitted events so trend detection
+        # doesn't double-report a metric that already has a breach/spike.
+        metric_seen_events: dict[str, bool] = {}
+        metric_configs = [
+            ("cpu_usage", [s[0] for s in cpu_pts], [s[1] for s in cpu_pts]),
+            ("memory_usage", [s[0] for s in mem_pts], [s[1] for s in mem_pts]),
+            ("latency_p99", [s[0] for s in lat_pts], [s[1] for s in lat_pts]),
+        ]
+        for metric_name, ts_list, val_list in metric_configs:
+            metric_events = self._detect_events(
+                timestamps=ts_list,
+                values=val_list,
+                metric_name=metric_name,
+            )
+            events += metric_events
+            metric_seen_events[metric_name] = len(metric_events) > 0
+
+        # Trend-based detection catches gradual degradations that no single
+        # point-based spike/breach would flag (e.g. a slow memory leak).
+        # Only add a trend event for a metric that has NO other events —
+        # a breached/spiking metric is already represented.
+        for metric_name, ts_list, val_list in metric_configs:
+            if not metric_seen_events[metric_name]:
+                events += self._detect_trend_events(
+                    timestamps=ts_list,
+                    values=val_list,
+                    metric_name=metric_name,
+                )
+
+        events.sort(key=lambda e: e.timestamp)
         # ── 5. Pick the dominant metric (widest value range) ────────
         # Used for segments + period detection so we analyse the
         # signal with the most variation.
@@ -323,6 +337,17 @@ class SREStateBuilder:
                 run_duration = (
                     timestamps[run_end - 1] - timestamps[run_start]
                 ).total_seconds()
+                # Samples are spaced tick_interval apart, so a run of N
+                # samples spans (N-1) * interval seconds. Add the interval
+                # back so a 180-sample run (180 * 1s) counts as 180s and
+                # satisfies the >= BREACH_DURATION_SECONDS check.
+                if len(values[run_start:run_end]) >= 2:
+                    sample_interval = (
+                        (timestamps[run_start + 1] - timestamps[run_start]).total_seconds()
+                        if run_start + 1 < run_end
+                        else 0.0
+                    )
+                    run_duration += sample_interval
 
                 if run_duration >= self.BREACH_DURATION_SECONDS:
                     peak_value = max(values[run_start:run_end])
@@ -389,6 +414,55 @@ class SREStateBuilder:
         events.sort(key=lambda e: e.timestamp)
         return events
 
+    def _detect_trend_events(
+        self,
+        timestamps: list[datetime],
+        values: list[float],
+        metric_name: str,
+    ) -> list[Event]:
+        """
+        Detect trend-based events (rising/falling) for a metric.
+
+        Steps to implement:
+        1. Compute the Trend using _compute_trend()
+        2. If the trend is "rising" or "falling" and the rate exceeds
+           a threshold (e.g., ±1% per minute), create an Event:
+           - type="trend"
+           - severity="medium" for moderate rates, "high" for extreme rates
+           - source=metric_name
+           - description=f"{metric_name} is {direction} at {rate:.1f}%/min"
+        3. Return the list of detected trend events
+
+        Returns:
+            list[Event]
+        """
+        n = len(values)
+        if n < 2:
+            return []
+
+        trend = self._compute_trend(timestamps, values)
+        events: list[Event] = []
+
+        # Net relative change over the window — guards against baseline
+        # noise (sinusoid drift) being misinterpreted as a real trend.
+        # The normalized %/min rate alone is too sensitive on short
+        # windows (a ±8 point drift on a ~38 mean reads as +21%/min).
+        net_change = (values[-1] - values[0]) / values[0] if values[0] != 0 else 0.0
+
+        # Only rising trends are incidents — a falling metric is a
+        # recovery, not a degradation.
+        if trend.direction == "rising" and net_change >= 0.15:
+            severity = "medium" if abs(trend.rate) < 3.0 else "high"
+            events.append(Event(
+                timestamp=timestamps[-1],
+                type="trend",
+                severity=severity,
+                source=metric_name,
+                description=f"{metric_name} is {trend.direction} at {trend.rate:+.1f}%/min",
+                raw_value=round(float(values[-1]), 3),
+            ))
+
+        return events
     
     def _detect_segments(
         self,
