@@ -3,14 +3,26 @@ stratum/scripts/eval_benchmark.py
 
 Evaluation benchmark for the Stratum SRE pipeline.
 
-Two-layer evaluation:
+Three layers of evaluation:
   1. Deterministic layer (no LLM) — does the TemporalContext correctly
      capture ground-truth events for each known scenario?
-  2. LLM reasoning layer — does the model return valid structured output
-     that correctly identifies the incident type?
+  2. LLM reasoning layer (structured) — does the model return valid
+     structured output that correctly identifies the incident type,
+     given the deterministic TemporalContext?
+  3. LLM reasoning layer (naive) — SAME question, but raw signals are
+     dumped straight into the prompt with NO TemporalContext processing.
+     This is the baseline the whole framework exists to beat:
+
+         naive:    LLM(raw signals) → answer
+         stratum:  signals → TemporalContext → LLM → decision
+
+    The structured and naive LLM layers share a single run_eval() —
+    the ONLY difference is how the prompt is constructed. The LLM call,
+    response parsing, and ground-truth scoring are identical, so the
+    two modes are directly comparable.
 
 Ground truth comes from the scenario name:
-    cpu_spike            → expect CPU/SRE events detected
+    cpu_spike            → expect CPU events detected
     memory_leak          → expect memory events detected
     latency_degradation  → expect latency events detected
     normal               → expect no high-severity events
@@ -19,18 +31,19 @@ Usage:
     python3 scripts/eval_benchmark.py --runs 3 --scenarios all
     python3 scripts/eval_benchmark.py --runs 5 --scenarios cpu_spike,memory_leak
     python3 scripts/eval_benchmark.py --no-llm   # deterministic-only eval
+    python3 scripts/eval_benchmark.py --naive    # also run naive baseline
+    python3 scripts/eval_benchmark.py --mode structured|naive|both  # explicit layer(s)
 """
 
 import argparse
+import json
 import logging
-import os
 import statistics
 import time
-from datetime import datetime
 
 # ── Ground-truth assertions for each scenario ────────────────────────────
 
-# Which metrics should have events in a correct TemporalContext.
+# Which metrics should surface in a correct analysis for each scenario.
 SCENARIO_METRIC_EXPECTATIONS: dict[str, list[str]] = {
     "cpu_spike": ["cpu_usage"],
     "memory_leak": ["memory_usage"],
@@ -54,6 +67,99 @@ SCENARIO_EXPECTATIONS: dict[str, callable] = {
     ),
 }
 
+# Metric → loose keyword the LLM should mention in a correct analysis.
+METRIC_KEYWORDS: dict[str, str] = {
+    "cpu_usage": "cpu",
+    "memory_usage": "mem",
+    "latency_p99": "latency",
+}
+
+
+# ── Shared scoring ───────────────────────────────────────────────────────
+
+def score_response(
+    analysis: str,
+    suggested_actions: list,
+    reasoning_trace: str,
+    expected_metric: list[str],
+    scenario: str,
+    run: int,
+) -> dict:
+    """
+    Score one LLM response against ground truth.
+
+    Used by BOTH the structured and naive paths so results are directly
+    comparable. Returns {valid_json, valid_fields, correct_incident, detail}.
+    """
+    # ── Structured output validity ─────────────────────────────
+    valid_json = False
+    valid_fields = False
+    try:
+        parsed = json.loads(reasoning_trace)
+        valid_json = True
+        required = [
+            "analysis",
+            "confidence",
+            "suggested_actions",
+            "root_cause",
+        ]
+        valid_fields = all(k in parsed for k in required)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # ── Incident-type match ────────────────────────────────────
+    evidence_text = " ".join(
+        [str(analysis), *[str(a) for a in suggested_actions]]
+    ).lower()
+    correct = True
+    for metric in expected_metric:
+        keyword = METRIC_KEYWORDS.get(metric, metric)
+        if keyword not in evidence_text:
+            correct = False
+            break
+
+    # For 'normal', the correct answer is that there are no severe issues.
+    if scenario == "normal":
+        correct = (
+            "high" not in str(analysis).lower()
+            or "no" in str(analysis).lower()
+        )
+
+    detail = ""
+    if not correct:
+        detail = (
+            f"  run={run + 1}: expected metric '{expected_metric}', "
+            f"LLM said: {str(analysis)[:100]}"
+        )
+
+    return {
+        "valid_json": valid_json,
+        "valid_fields": valid_fields,
+        "correct_incident": correct,
+        "detail": detail,
+    }
+
+
+# ── Naive prompt builder — NO deterministic processing ───────────────────
+
+def build_naive_prompt(signals: list) -> str:
+    """
+    Build a raw-signal prompt with NO TemporalContext, NO state builder.
+
+    This is the "naive" baseline: dump raw metric rows into the prompt and
+    ask the LLM to identify the root cause directly. No event detection,
+    trend analysis, or aggregation is performed — just raw telemetry.
+    """
+    lines = [f"{s.timestamp} {s.name}={s.value}{s.unit}" for s in signals]
+    return (
+        "Here is raw infrastructure telemetry data:\n"
+        + "\n".join(lines)
+        + "\n\nWhat is the root cause of any issue, if there is one? "
+        "Respond with the same JSON schema as before."
+    )
+
+
+# ── Eval layers ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -80,6 +186,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-llm",
         action="store_true",
         help="Skip the LLM layer — deterministic state-builder eval only.",
+    )
+    parser.add_argument(
+        "--naive",
+        action="store_true",
+        help="Legacy alias for --mode both — run structured AND naive layers.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["structured", "naive", "both"],
+        default="both",
+        help="Which LLM layer(s) to run (default: both). To run them in "
+             "parallel processes: terminal 1 → --mode structured, "
+             "terminal 2 → --mode naive.",
     )
     parser.add_argument(
         "--seed",
@@ -120,16 +239,29 @@ def deterministic_eval(scenario: str, runs: int, seed: int) -> dict:
     return results
 
 
-def llm_eval(scenario: str, runs: int, seed: int, llm_model: str) -> dict:
-    """Benchmark the full pipeline including LLM reasoning."""
+def run_eval(
+    scenario: str,
+    mode: str = "structured",
+    runs: int = 3,
+    seed: int = 42,
+    llm_model: str = "qwen2.5",
+) -> dict:
+    """
+    Run the LLM layer for one scenario in either mode.
+
+    mode="structured": signals → build_state → TemporalContext → build_prompt → LLM
+    mode="naive":      signals → build_naive_prompt (raw)        → LLM
+
+    The ONLY difference between modes is how the prompt is constructed.
+    The LLM call, response parsing, and ground-truth scoring are identical,
+    so the structured and naive results are directly comparable.
+    """
     from stratum.data.sre.scenarios import generate_scenario_signals
     from stratum.adapters.sre.output import SREAdapter
-    from stratum.core.reasoning_agent import ReasoningAgent
     from stratum.llm.ollama import OllamaLLM
 
     adapter = SREAdapter()
     llm = OllamaLLM(model=llm_model, timeout=120)
-    agent = ReasoningAgent(adapter=adapter, llm=llm)
 
     results = {
         "valid_json": 0,
@@ -139,77 +271,63 @@ def llm_eval(scenario: str, runs: int, seed: int, llm_model: str) -> dict:
         "llm_times": [],
         "details": [],
     }
-
-    # Map determined by which metric shows events in the context.
-    # We compare the LLM's cited root_cause / evidence against ground truth.
     expected_metric = SCENARIO_METRIC_EXPECTATIONS[scenario]
 
     for run in range(runs):
         signals = generate_scenario_signals(scenario, seed=seed + run)
 
+        # ── The only branch: how the prompt is built ──────────────
+        if mode == "naive":
+            prompt = build_naive_prompt(signals)
+        else:
+            context = adapter.build_state(signals)
+            prompt = adapter.build_prompt(context)
+
+        # ── Same LLM call either way ─────────────────────────────
         t0 = time.time()
-        decision, trace = agent.reason_with_trace(signals)
+        raw = llm.generate(prompt)
         llm_time = time.time() - t0
         results["llm_times"].append(llm_time)
 
-        # ── Structured output validity ─────────────────────────────
-        import json
+        # ── Same parsing either way ──────────────────────────────
+        decision_data = adapter.parse_output(raw)
 
-        valid_json = False
-        valid_fields = False
-        try:
-            parsed = json.loads(decision.reasoning_trace)
-            valid_json = True
-            required = [
-                "analysis",
-                "confidence",
-                "suggested_actions",
-                "root_cause",
-            ]
-            valid_fields = all(k in parsed for k in required)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        # ── Same grading either way ──────────────────────────────
+        reasoning_trace = json.dumps(decision_data, default=str)
+        score = score_response(
+            analysis=str(decision_data.get("analysis", "")),
+            suggested_actions=list(decision_data.get("suggested_actions", [])),
+            reasoning_trace=reasoning_trace,
+            expected_metric=expected_metric,
+            scenario=scenario,
+            run=run,
+        )
 
-        if valid_json:
-            results["valid_json"] += 1
-        if valid_fields:
-            results["valid_fields"] += 1
-
-        # ── Incident-type match ────────────────────────────────────
-        # Check if the LLM's evidence/analysis mentions the expected metric.
-        evidence_text = " ".join(
-            [
-                str(decision.analysis),
-                *getattr(decision, "suggested_actions", []),
-            ]
-        ).lower()
-        correct = True
-        for metric in expected_metric:
-            # Metric names map loosely: cpu_usage→cpu, memory_usage→memory, latency_p99→latency
-            keyword = {
-                "cpu_usage": "cpu",
-                "memory_usage": "mem",
-                "latency_p99": "latency",
-            }.get(metric, metric)
-            if keyword not in evidence_text:
-                correct = False
-                break
-
-        # For 'normal', the correct answer is there are no severe issues.
-        if scenario == "normal":
-            correct = "high" not in str(decision.analysis).lower() or "no" in str(decision.analysis).lower()
-
-        if correct:
-            results["correct_incident"] += 1
-        else:
-            results["details"].append(
-                f"  run={run + 1}: expected metric '{expected_metric}', "
-                f"LLM said: {str(decision.analysis)[:100]}"
-            )
-
-        results["confidence_scores"].append(decision.confidence)
+        results["valid_json"] += int(score["valid_json"])
+        results["valid_fields"] += int(score["valid_fields"])
+        results["correct_incident"] += int(score["correct_incident"])
+        results["confidence_scores"].append(
+            max(0.0, min(1.0, float(decision_data.get("confidence", 0.0))))
+        )
+        if score["detail"]:
+            results["details"].append(score["detail"])
 
     return results
+
+
+def _print_llm_layer(title: str, res: dict, runs: int) -> None:
+    """Print one LLM-layer result block (structured or naive)."""
+    n = max(1, runs)
+    print(f"\n[{title}]")
+    print(f"  valid JSON:      {res['valid_json']}/{runs} ({100.0 * res['valid_json'] / n:.0f}%)")
+    print(f"  valid fields:    {res['valid_fields']}/{runs} ({100.0 * res['valid_fields'] / n:.0f}%)")
+    print(f"  incident match:  {res['correct_incident']}/{runs} ({100.0 * res['correct_incident'] / n:.0f}%)")
+    if res["confidence_scores"]:
+        print(f"  confidence:      mean={statistics.mean(res['confidence_scores']):.2f}")
+    if res["llm_times"]:
+        print(f"  llm time:        mean={statistics.mean(res['llm_times']):.1f}s, max={max(res['llm_times']):.1f}s")
+    for detail in res["details"]:
+        print(detail)
 
 
 def main() -> int:
@@ -240,21 +358,42 @@ def main() -> int:
         for detail in det["details"]:
             print(detail)
 
-        # ── Layer 2: LLM (optional) ────────────────────────────────
-        if not args.no_llm:
-            llm_res = llm_eval(scenario, args.runs, args.seed, args.llm)
-            n = max(1, args.runs)
-            print(f"\n[LLM Reasoning Layer] model={args.llm}")
-            print(f"  valid JSON:      {llm_res['valid_json']}/{args.runs} ({100.0 * llm_res['valid_json'] / n:.0f}%)")
-            print(f"  valid fields:    {llm_res['valid_fields']}/{args.runs} ({100.0 * llm_res['valid_fields'] / n:.0f}%)")
-            # Only meaningful for incident scenarios, skip match for normal.
-            print(f"  incident match:  {llm_res['correct_incident']}/{args.runs} ({100.0 * llm_res['correct_incident'] / n:.0f}%)")
-            if llm_res["confidence_scores"]:
-                print(f"  confidence:      mean={statistics.mean(llm_res['confidence_scores']):.2f}")
-            if llm_res["llm_times"]:
-                print(f"  llm time:        mean={statistics.mean(llm_res['llm_times']):.1f}s, max={max(llm_res['llm_times']):.1f}s")
-            for detail in llm_res["details"]:
-                print(detail)
+        # Resolve which LLM layers to run. --naive is a legacy alias
+        # for --mode both.
+        mode = args.mode
+        if args.naive:
+            mode = "both"
+
+        # ── Layer 2: structured LLM (optional) ─────────────────────
+        if not args.no_llm and mode in ("structured", "both"):
+            llm_res = run_eval(
+                scenario,
+                mode="structured",
+                runs=args.runs,
+                seed=args.seed,
+                llm_model=args.llm,
+            )
+            _print_llm_layer(
+                f"LLM Reasoning Layer (structured) — model={args.llm}",
+                llm_res,
+                args.runs,
+            )
+
+        # ── Layer 3: naive baseline (optional) ─────────────────────
+        if not args.no_llm and mode in ("naive", "both"):
+            naive_res = run_eval(
+                scenario,
+                mode="naive",
+                runs=args.runs,
+                seed=args.seed,
+                llm_model=args.llm,
+            )
+            _print_llm_layer(
+                f"LLM Reasoning Layer (naive, no TemporalContext) — "
+                f"model={args.llm}",
+                naive_res,
+                args.runs,
+            )
 
     print("\n" + "═" * 70)
     print("BENCHMARK COMPLETE")
