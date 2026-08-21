@@ -101,10 +101,13 @@ METRIC_KEYWORDS: dict[str, str] = {
 # If the LLM mentions a term in this list that is NOT among the metrics
 # actually present in the input signals, that's a hallucination.
 HALLUCINATION_VOCAB: list[str] = [
-    "cpu", "memory", "mem", "latency", "disk", "network", "database",
-    "queue", "connection pool", "container", "pod", "gpu", "io",
+    "cpu", "memory", "latency", "disk", "network", "database",
+    "queue", "connection pool", "container", "pod", "gpu",
     "disk_usage", "error_rate", "request_rate",
 ]
+# NOTE: short substrings like "io" / "mem" were removed — "io" matches
+# "operational/production/indication", "mem" matches "implementation",
+# producing false-positive hallucinations in EVERY analysis.
 
 # Rough token estimate heuristic (LLM tokens ≈ 4 chars for English/numeric).
 TOKEN_CHARS_RATIO = 4.0
@@ -277,17 +280,16 @@ def score_response(
     if expected_class:
         strict_class = expected_class in root_cause_lower
     else:
-        # Normal: root cause should indicate healthy / no incident.
-        strict_class = any(
-            w in root_cause_lower
-            for w in ["no", "normal", "healthy", "none", "unknown", "no issue"]
-        )
+        HEALTHY_PHRASES = [
+            "healthy", "no issue", "no anomal", "no incident",
+            "stable, no", "normal operation", "no significant issue",
+        ]
+        strict_class = any(phrase in root_cause_lower for phrase in HEALTHY_PHRASES)
 
     # ── Hallucination penalty (STRICT) ──────────────────────────
     hallucinated = False
     for term in HALLUCINATION_VOCAB:
         if term in evidence_text:
-            # is this term actually a substring of any metric name that's present?
             term_is_grounded = any(term in metric_name for metric_name in present_metrics)
             if not term_is_grounded:
                 hallucinated = True

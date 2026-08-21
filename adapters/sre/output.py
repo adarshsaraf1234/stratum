@@ -87,34 +87,6 @@ class SREAdapter(DomainAdapter):
         return self.state_builder.build_state(signals)
 
     def build_prompt(self, context: TemporalContext) -> str:
-        """
-        Build the RCA prompt for the LLM.
-
-        Steps to implement:
-        1. Start with a system-style instruction:
-           "You are an SRE root cause analysis engine. Analyze the
-            following system state and identify the root cause of the
-            incident. Respond with JSON only."
-        2. Include the TemporalContext serialized as JSON
-           (use context.model_dump(mode="json"))
-        3. Include the summary string
-        4. Specify expected output schema:
-           {
-             "root_cause": str,
-             "severity": "low"|"medium"|"high"|"critical",
-             "analysis": str,
-             "confidence": float,
-             "affected_services": [str],
-             "remediation_steps": [str],
-             "evidence": [str],
-             "suggested_actions": [str]
-           }
-        5. Emphasize: "Base your analysis ONLY on the provided context.
-           Do not invent metrics or services."
-
-        Returns:
-            str
-        """
         # ── 1. System-style instruction ─────────────────────────────
         prompt = (
             "You are an SRE root cause analysis engine. Analyze the "
@@ -123,7 +95,6 @@ class SREAdapter(DomainAdapter):
         )
 
         # ── 2. TemporalContext serialized as JSON ───────────────────
-        # Pydantic 1.x → .dict() + default=str serializes datetimes safely
         context_json = json.dumps(context.dict(), indent=2, default=str)
         prompt += "=== SYSTEM STATE ===\n"
         prompt += context_json + "\n\n"
@@ -134,6 +105,19 @@ class SREAdapter(DomainAdapter):
             context.summary if context.summary else "No summary available."
         )
         prompt += "\n\n"
+
+        # ── 3.5. NEW: explicit instruction when no events detected ──
+        if len(context.events) == 0:
+            prompt += (
+                "=== IMPORTANT ===\n"
+                "No events were detected in this window. The system is "
+                "healthy. Do NOT speculate about minor trend fluctuations "
+                "as if they were incidents — small rises or falls in a "
+                "metric with no detected event are normal noise, not a "
+                "root cause. Your root_cause field MUST state that the "
+                "system is healthy and no anomalies were found. Do not "
+                "invent a cause.\n\n"
+            )
 
         # ── 4. Expected output schema ───────────────────────────────
         prompt += (

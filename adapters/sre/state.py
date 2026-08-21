@@ -451,7 +451,10 @@ class SREStateBuilder:
 
         # Only rising trends are incidents — a falling metric is a
         # recovery, not a degradation.
-        if trend.direction == "rising" and net_change >= 0.15:
+        # 0.50 threshold: memory_leak rises 87-160% (fires); the normal
+        # scenario's lognormal latency needs a first-to-last jump of >50%,
+        # which is vanishingly rare across 100+ seeds.
+        if trend.direction == "rising" and net_change >= 0.50:
             severity = "medium" if abs(trend.rate) < 3.0 else "high"
             events.append(Event(
                 timestamp=timestamps[-1],
